@@ -1,4 +1,4 @@
-// rasks-linkedin-helper - reads one person's LinkedIn inbox on their own Mac.
+// rasks-linkedin-helper - reads one person's LinkedIn inbox on their own Mac, and sends the replies they approve.
 // Copyright (C) 2026 Rasks
 //
 // This program is free software: you can redistribute it and/or modify
@@ -15,18 +15,22 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // The helper hosts mautrix-linkedin's LinkedIn client (linkedingo, unmodified)
-// with no Matrix server, behind a small read-only API on 127.0.0.1:
+// with no Matrix server, behind a small API on 127.0.0.1:
 //
-//	GET /status                          who is signed in, and the realtime state
-//	GET /conversations?before=<ms>       the primary inbox, 20 at a time, with unread state
-//	GET /threads/{thread}/messages       a thread's messages, newest last (?before=<ms>&count=)
-//	GET /events                          Server-Sent Events: each new message as it lands
+//	GET  /status                         who is signed in, and the realtime state
+//	GET  /conversations?before=<ms>      the primary inbox, 20 at a time, with unread state
+//	GET  /threads/{thread}/messages      a thread's messages, newest last (?before=<ms>&count=)
+//	POST /threads/{thread}/messages      send one text reply the person approved in Rasks
+//	GET  /events                         Server-Sent Events: each new message as it lands
 //
-// It never sends, reacts, marks read, or looks up a profile: there is no route
-// that could, and the only LinkedIn calls it makes are the reads above plus the
-// realtime connection the web app itself keeps open (with its one heartbeat a
-// minute). Every request needs the bearer token printed on start, and a request
-// from a web page (any Origin header) is refused.
+// Its one write is a text reply in a conversation it already listed: it never
+// starts a conversation, sends a file, reacts, marks read, or looks up a
+// profile, and there is no route that could. A reply carries the Rasks id it
+// was queued under, and a second request with the same id gets the first one's
+// answer without sending again. The only other LinkedIn calls are the reads
+// above plus the realtime connection the web app itself keeps open (with its
+// one heartbeat a minute). Every request needs the bearer token printed on
+// start, and a request from a web page (any Origin header) is refused.
 //
 // The session (the sign-in window's cookies and browser headers) lives in the
 // macOS Keychain, never in a file: `save` puts it there from stdin, `forget`
@@ -57,6 +61,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
@@ -212,10 +217,32 @@ type helper struct {
 	peopleMu sync.Mutex
 	people   map[string]person
 	threads  map[string]linkedingo.URN
+
+	// send makes LinkedIn's one write call (the client's SendMessage; tests
+	// pass a fake). sendMu runs one send at a time, and sent keeps each Rasks
+	// id's answer, so a repeat never sends twice.
+	send   func(ctx context.Context, conv linkedingo.URN, text, id string) (linkedingo.Message, error)
+	sendMu sync.Mutex
+	sent   map[string]sentReply
+}
+
+// sentReply is what a send answered: the message LinkedIn made, or why it failed.
+type sentReply struct {
+	ID  string `json:"id,omitempty"`
+	At  int64  `json:"at,omitempty"`
+	Err string `json:"-"`
 }
 
 func newHelper(log zerolog.Logger, keys store) *helper {
-	return &helper{log: log, keys: keys, subs: map[chan []byte]struct{}{}, counts: map[string]int{}, people: map[string]person{}, threads: map[string]linkedingo.URN{}, state: "starting"}
+	h := &helper{log: log, keys: keys, subs: map[chan []byte]struct{}{}, counts: map[string]int{}, people: map[string]person{}, threads: map[string]linkedingo.URN{}, sent: map[string]sentReply{}, state: "starting"}
+	h.send = func(ctx context.Context, conv linkedingo.URN, text, id string) (linkedingo.Message, error) {
+		resp, err := h.cli.SendMessage(ctx, conv, linkedingo.SendMessageBody{Text: text}, nil, id)
+		if err != nil {
+			return linkedingo.Message{}, err
+		}
+		return resp.Data, nil
+	}
+	return h
 }
 
 // exit says why it stopped on stdout, as the ready line would, and exits: the
@@ -456,6 +483,15 @@ func (h *helper) thread(u linkedingo.URN) string {
 	return t
 }
 
+// listedURN is the whole URN of a conversation the helper listed (on an inbox
+// page or in an event), and false for any other: a reply goes only to one.
+func (h *helper) listedURN(thread string) (linkedingo.URN, bool) {
+	h.peopleMu.Lock()
+	defer h.peopleMu.Unlock()
+	u, ok := h.threads[thread]
+	return u, ok
+}
+
 func (h *helper) conversationURN(thread string) linkedingo.URN {
 	h.peopleMu.Lock()
 	defer h.peopleMu.Unlock()
@@ -612,6 +648,7 @@ func (h *helper) routes() http.Handler {
 		}
 		writeJSON(w, map[string]any{"messages": out})
 	})
+	mux.HandleFunc("POST /threads/{thread}/messages", h.reply)
 	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -642,6 +679,84 @@ func (h *helper) routes() http.Handler {
 		}
 	})
 	return h.auth(mux)
+}
+
+// maxReply is the longest reply, in characters: LinkedIn's own limit for a message.
+const maxReply = 8000
+
+// replyID is a Rasks outbox id, a UUID: LinkedIn takes it as the message's origin token.
+func replyID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+			if c != '-' {
+				return false
+			}
+		case (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// reply sends one text message to a conversation the helper listed, as the
+// person: {"id": "<Rasks outbox id>", "text": "…"}. It answers {"id", "at"}
+// with LinkedIn's id for the new message. The same id again answers the first
+// send's result and sends nothing, so a retry never sends twice.
+func (h *helper) reply(w http.ResponseWriter, r *http.Request) {
+	thread := r.PathValue("thread")
+	if thread == "" || strings.ContainsAny(thread, "(),:/ ") || len(thread) > 200 {
+		http.Error(w, "not a thread", http.StatusBadRequest)
+		return
+	}
+	var body struct {
+		ID   string `json:"id"`
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
+		http.Error(w, "not a reply", http.StatusBadRequest)
+		return
+	}
+	text := strings.TrimSpace(body.Text)
+	if !replyID(body.ID) || text == "" || !utf8.ValidString(text) || utf8.RuneCountInString(text) > maxReply {
+		http.Error(w, "not a reply", http.StatusBadRequest)
+		return
+	}
+	conv, ok := h.listedURN(thread)
+	if !ok {
+		http.Error(w, "not a listed conversation", http.StatusNotFound)
+		return
+	}
+
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	if done, ok := h.sent[body.ID]; ok {
+		if done.Err != "" {
+			http.Error(w, done.Err, http.StatusConflict)
+			return
+		}
+		writeJSON(w, done)
+		return
+	}
+	msg, err := h.send(r.Context(), conv, text, body.ID)
+	if err != nil {
+		// Whether LinkedIn took it is not known: the id stays spent, so a retry
+		// asks the person to look in LinkedIn rather than send it again.
+		h.sent[body.ID] = sentReply{Err: "the send failed: " + err.Error()}
+		h.log.Warn().Err(err).Msg("Couldn't send a reply")
+		h.fail(w, err)
+		return
+	}
+	done := sentReply{ID: tail(msg.EntityURN), At: msg.DeliveredAt.UnixMilli()}
+	if done.At <= 0 {
+		done.At = time.Now().UnixMilli()
+	}
+	h.sent[body.ID] = done
+	writeJSON(w, done)
 }
 
 // auth lets in only the Mac app: the token, and no browser page on any origin.
