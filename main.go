@@ -721,8 +721,9 @@ func (h *helper) reply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not a reply", http.StatusBadRequest)
 		return
 	}
-	text := strings.TrimSpace(body.Text)
-	if !replyID(body.ID) || text == "" || !utf8.ValidString(text) || utf8.RuneCountInString(text) > maxReply {
+	// The words go exactly as the person approved them; only the checks read them trimmed.
+	text := body.Text
+	if !replyID(body.ID) || strings.TrimSpace(text) == "" || !utf8.ValidString(text) || utf8.RuneCountInString(text) > maxReply {
 		http.Error(w, "not a reply", http.StatusBadRequest)
 		return
 	}

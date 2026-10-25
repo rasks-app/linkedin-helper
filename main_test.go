@@ -172,7 +172,7 @@ func TestReply(t *testing.T) {
 	if rec := post("2-abc=", `{"id":"`+id+`","text":"  Thanks, Tuesday works.  "}`); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"2-msg="`) || !strings.Contains(rec.Body.String(), `"at":1761300000000`) {
 		t.Fatalf("send = %d %s", rec.Code, rec.Body)
 	}
-	if len(calls) != 1 || calls[0] != listed.String()+" Thanks, Tuesday works. "+id {
+	if len(calls) != 1 || calls[0] != listed.String()+"   Thanks, Tuesday works.   "+id {
 		t.Fatalf("calls = %q", calls)
 	}
 	// The same id again answers the first send and sends nothing.
