@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
+	"go.mau.fi/util/jsontime"
 )
 
 type memStore struct {
@@ -136,5 +138,75 @@ func TestSaveOnlyWhenChanged(t *testing.T) {
 	h.save()
 	if m.saves != before+1 {
 		t.Fatal("saved with nothing changed")
+	}
+}
+
+func TestReply(t *testing.T) {
+	h := newHelper(zerolog.Nop(), &memStore{})
+	h.me = linkedingo.NewURN("urn:li:fsd_profile:ME")
+	h.token = "secret"
+	listed := linkedingo.NewURN("urn:li:msg_conversation:(urn:li:fsd_profile:ME,2-abc=)")
+	h.thread(listed)
+	var calls []string
+	fail := false
+	h.send = func(_ context.Context, conv linkedingo.URN, text, id string) (linkedingo.Message, error) {
+		calls = append(calls, conv.String()+" "+text+" "+id)
+		if fail {
+			return linkedingo.Message{}, errors.New("boom")
+		}
+		return linkedingo.Message{
+			EntityURN:   linkedingo.NewURN("urn:li:msg_message:(urn:li:fsd_profile:ME,2-msg=)"),
+			DeliveredAt: jsontime.UMInt(1761300000000),
+		}, nil
+	}
+	srv := h.routes()
+	post := func(thread, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/threads/"+thread+"/messages", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+	const id = "0f8b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d"
+
+	if rec := post("2-abc=", `{"id":"`+id+`","text":"  Thanks, Tuesday works.  "}`); rec.Code != 200 || !strings.Contains(rec.Body.String(), `"id":"2-msg="`) || !strings.Contains(rec.Body.String(), `"at":1761300000000`) {
+		t.Fatalf("send = %d %s", rec.Code, rec.Body)
+	}
+	if len(calls) != 1 || calls[0] != listed.String()+"   Thanks, Tuesday works.   "+id {
+		t.Fatalf("calls = %q", calls)
+	}
+	// The same id again answers the first send and sends nothing.
+	if rec := post("2-abc=", `{"id":"`+id+`","text":"Thanks, Tuesday works."}`); rec.Code != 200 || len(calls) != 1 {
+		t.Fatalf("repeat = %d, calls %d", rec.Code, len(calls))
+	}
+	// Never a conversation it did not list.
+	if rec := post("2-other", `{"id":"1f8b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d","text":"Hi"}`); rec.Code != 404 || len(calls) != 1 {
+		t.Fatalf("unlisted = %d", rec.Code)
+	}
+	for _, bad := range []string{`{"id":"nope","text":"Hi"}`, `{"id":"` + id[:35] + `x","text":"Hi"}`, `{"id":"2f8b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d","text":"   "}`, `{"id":"2f8b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d","text":"` + strings.Repeat("a", maxReply+1) + `"}`, `not json`} {
+		if rec := post("2-abc=", bad); rec.Code != 400 {
+			t.Errorf("bad body %.40q = %d", bad, rec.Code)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("a bad body sent: %d", len(calls))
+	}
+	// A failed send keeps its id spent: a retry is refused, never sent again.
+	fail = true
+	failed := "3f8b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d"
+	if rec := post("2-abc=", `{"id":"`+failed+`","text":"Hi"}`); rec.Code != 502 {
+		t.Fatalf("failed send = %d", rec.Code)
+	}
+	fail = false
+	if rec := post("2-abc=", `{"id":"`+failed+`","text":"Hi"}`); rec.Code != 409 || len(calls) != 2 {
+		t.Fatalf("retry of a failed send = %d, calls %d", rec.Code, len(calls))
+	}
+	// GET stays a read.
+	req := httptest.NewRequest("DELETE", "/threads/2-abc=/messages", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE = %d", rec.Code)
 	}
 }

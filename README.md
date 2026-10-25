@@ -1,13 +1,14 @@
 # rasks-linkedin-helper
 
-Reads one person's LinkedIn inbox on their own Mac, for the Rasks Mac app to show in Rasks's Messages. It has no Matrix server: it hosts [mautrix-linkedin](https://github.com/mautrix/linkedin)'s LinkedIn client library, `pkg/linkedingo`, unmodified and pinned by commit in `go.mod`, behind a small read-only API on `127.0.0.1`.
+Reads one person's LinkedIn inbox on their own Mac, for the Rasks Mac app to show in Rasks's Messages, and sends the replies they approve there. It has no Matrix server: it hosts [mautrix-linkedin](https://github.com/mautrix/linkedin)'s LinkedIn client library, `pkg/linkedingo`, unmodified and pinned by commit in `go.mod`, behind a small API on `127.0.0.1`.
 
 AGPL-3.0, since it links mautrix-linkedin. Rasks never imports it: the Mac app starts it as its own program and talks to it over the loopback address only. The Rasks Mac app ships this binary built from a pinned commit of this repo.
 
 ## What it does, and what it never does
 
 - Reads the primary inbox (20 conversations a page), a thread's messages, and the realtime stream LinkedIn's own web app keeps open, with its one heartbeat a minute. LinkedIn closes the stream about every 14 minutes; the helper reconnects and catches up by sync token. Nothing polls on a clock.
-- Never sends, reacts, marks read, or looks up a profile. There is no route that could.
+- Sends one kind of thing: a text reply in a conversation it already listed, which the person approved in Rasks. Each carries the id Rasks queued it under; the same id again gets the first answer and sends nothing.
+- Never starts a conversation, sends a file, reacts, marks read, or looks up a profile. There is no route that could.
 - Keeps the session in the macOS Keychain (service `Rasks LinkedIn`), never in a file, and saves the cookies LinkedIn rotates back to it.
 - Sends every request with the browser headers and user agent of the window the person signed in with.
 - HTTP/1.1 only (`//go:debug http2client=0`): over Go's HTTP/2, LinkedIn left the inbox reads hanging for minutes and the realtime connect for 30 s.
@@ -37,6 +38,7 @@ Every request needs `Authorization: Bearer <token>`; a request with an `Origin` 
 - `GET /status`: who is signed in, the realtime state (`connected`, `reconnecting`, `signed_out`, `failed`), event counts.
 - `GET /conversations?before=<ms>`: the primary inbox, 20 a page, newest first. Each has `id` (LinkedIn's thread id, `2-…`, as in `linkedin.com/messaging/thread/<id>/`), `title`, `group`, `unread`, `lastActivity`, `people` (name, headline, photo, profile link), `last` message, and `categories` (`INMAIL`, …).
 - `GET /threads/{id}/messages?before=<ms>&count=<n>`: a thread's messages, oldest first, at most 50.
+- `POST /threads/{id}/messages` with `{"id":"<uuid>","text":"…"}`: send a text reply, at most 8,000 characters, to a conversation the helper listed (404 otherwise). Answers `{"id","at"}`, LinkedIn's id and time for the new message. A send that failed keeps its id spent: the same id again answers 409, so a retry never sends twice.
 - `GET /events`: Server-Sent Events, `message`, `conversation`, `seen`, `signed_out`, `failed`.
 
 A 401 from LinkedIn answers 401 and sends `signed_out`.
