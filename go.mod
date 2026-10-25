@@ -3,6 +3,7 @@ module rasks.app/linkedin-helper
 go 1.27.3
 
 require (
+	github.com/keybase/go-keychain v0.0.1
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/mautrix-linkedin v0.2609.1-0.20261024103745-caa625aefc22
 )

@@ -17,15 +17,20 @@
 // The helper hosts mautrix-linkedin's LinkedIn client (linkedingo, unmodified)
 // with no Matrix server, behind a small read-only API on 127.0.0.1:
 //
-//	GET /status                         who is signed in, and the realtime state
-//	GET /conversations?before=<ms>      the primary inbox, 20 at a time, with unread state
-//	GET /conversations/{urn}/messages   a thread's messages, newest last (?before=<ms>&count=)
-//	GET /events                         Server-Sent Events: each new message as it lands
+//	GET /status                          who is signed in, and the realtime state
+//	GET /conversations?before=<ms>       the primary inbox, 20 at a time, with unread state
+//	GET /threads/{thread}/messages       a thread's messages, newest last (?before=<ms>&count=)
+//	GET /events                          Server-Sent Events: each new message as it lands
 //
 // It never sends, reacts, marks read, or looks up a profile: there is no route
 // that could, and the only LinkedIn calls it makes are the reads above plus the
 // realtime connection the web app itself keeps open (with its one heartbeat a
-// minute). Every request needs the bearer token printed on start.
+// minute). Every request needs the bearer token printed on start, and a request
+// from a web page (any Origin header) is refused.
+//
+// The session (the sign-in window's cookies and browser headers) lives in the
+// macOS Keychain, never in a file: `save` puts it there from stdin, `forget`
+// deletes it, and the server saves the cookies LinkedIn rotates back to it.
 //
 // HTTP/1.1 only: over Go's HTTP/2, LinkedIn left the inbox reads hanging for
 // minutes and the realtime connect for 30 s; over HTTP/1.1 each answers in ~150 ms.
@@ -42,6 +47,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -56,7 +62,13 @@ import (
 	"go.mau.fi/mautrix-linkedin/pkg/linkedingo"
 )
 
-// Session is what the sign-in window saves: the browser's cookies for
+// Exit codes the Mac app reads: signed out means sign in again, never retry.
+const (
+	exitFailed    = 1
+	exitSignedOut = 3
+)
+
+// Session is what the sign-in window captured: the browser's cookies for
 // www.linkedin.com, the X-LI headers its own requests carried, and its exact
 // browser headers, so every request looks like the browser that signed in.
 type Session struct {
@@ -67,43 +79,83 @@ type Session struct {
 	SyncToken    string            `json:"syncToken,omitempty"`
 }
 
-type helper struct {
-	log     zerolog.Logger
-	path    string
-	session Session
-	jar     *linkedingo.StringCookieJar
-	cli     *linkedingo.Client
-	me      linkedingo.URN
-	name    string
-	token   string
-
-	mu        sync.Mutex
-	subs      map[chan []byte]struct{}
-	state     string
-	stateErr  string
-	lastEvent time.Time
-	counts    map[string]int
-
-	peopleMu sync.Mutex
-	people   map[string]person
+// store keeps the session: the Keychain, or a fake in tests.
+type store interface {
+	Load() (Session, error)
+	Save(Session) error
+	Forget() error
 }
 
 func main() {
-	sessionPath := flag.String("session", "session.json", "the session the sign-in window saved")
-	addr := flag.String("addr", "127.0.0.1:0", "where to listen; port 0 picks a free one")
-	verbose := flag.Bool("v", false, "log LinkedIn requests")
-	flag.Parse()
+	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).With().Timestamp().Logger()
+	keys := keychainStore{service: keychainService, account: keychainAccount}
 
-	level := zerolog.InfoLevel
-	if *verbose {
-		level = zerolog.DebugLevel
+	cmd := "serve"
+	args := os.Args[1:]
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		cmd, args = args[0], args[1:]
 	}
-	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.TimeOnly}).
-		Level(level).With().Timestamp().Logger()
+	switch cmd {
+	case "save":
+		// The Mac app pipes the sign-in window's session in; it never touches a file.
+		if err := saveFrom(os.Stdin, keys); err != nil {
+			log.Error().Err(err).Msg("Couldn't save the session")
+			os.Exit(exitFailed)
+		}
+		fmt.Println(`{"saved":true}`)
+	case "forget":
+		if err := keys.Forget(); err != nil {
+			log.Error().Err(err).Msg("Couldn't delete the session")
+			os.Exit(exitFailed)
+		}
+		fmt.Println(`{"forgotten":true}`)
+	case "serve":
+		serve(log, keys, args)
+	case "version":
+		fmt.Println(version)
+	default:
+		fmt.Fprintf(os.Stderr, "usage: %s [serve [-addr 127.0.0.1:0] [-v] | save < session.json | forget | version]\n", os.Args[0])
+		os.Exit(2)
+	}
+}
 
-	h := &helper{log: log, path: *sessionPath, subs: map[chan []byte]struct{}{}, counts: map[string]int{}, people: map[string]person{}, state: "starting"}
+// version is set at build time (-ldflags "-X main.version=…").
+var version = "dev"
+
+// saveFrom reads one session from r and keeps it, once it has the cookies a
+// LinkedIn session needs.
+func saveFrom(r io.Reader, keys store) error {
+	var s Session
+	if err := json.NewDecoder(io.LimitReader(r, 1<<20)).Decode(&s); err != nil {
+		return fmt.Errorf("session: %w", err)
+	}
+	jar := linkedingo.NewEmptyStringCookieJar()
+	if err := jar.UnmarshalJSON(s.Cookies); err != nil {
+		return fmt.Errorf("cookies: %w", err)
+	}
+	if jar.GetCookie(linkedingo.LinkedInCookieJSESSIONID) == "" {
+		return errors.New("the session has no JSESSIONID cookie")
+	}
+	return keys.Save(s)
+}
+
+func serve(log zerolog.Logger, keys store, args []string) {
+	flags := flag.NewFlagSet("serve", flag.ExitOnError)
+	addr := flags.String("addr", "127.0.0.1:0", "where to listen; port 0 picks a free one")
+	verbose := flags.Bool("v", false, "log LinkedIn requests")
+	_ = flags.Parse(args)
+	if *verbose {
+		log = log.Level(zerolog.DebugLevel)
+	} else {
+		log = log.Level(zerolog.InfoLevel)
+	}
+	if host, _, err := net.SplitHostPort(*addr); err != nil || (host != "127.0.0.1" && host != "::1") {
+		log.Fatal().Str("addr", *addr).Msg("The helper listens on the loopback address only")
+	}
+
+	h := newHelper(log, keys)
 	if err := h.load(); err != nil {
-		log.Fatal().Err(err).Msg("Couldn't read the session")
+		h.exit(err, "Couldn't read the session")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -111,7 +163,7 @@ func main() {
 	ctx = log.WithContext(ctx)
 
 	if err := h.start(ctx); err != nil {
-		log.Fatal().Err(err).Msg("Couldn't start")
+		h.exit(err, "Couldn't start")
 	}
 
 	ln, err := net.Listen("tcp", *addr)
@@ -120,10 +172,11 @@ func main() {
 	}
 	h.token = randomToken()
 	// The first line on stdout is how the Mac app finds the helper.
-	ready, _ := json.Marshal(map[string]any{"ready": true, "url": "http://" + ln.Addr().String(), "token": h.token, "me": h.name})
+	ready, _ := json.Marshal(map[string]any{"ready": true, "url": "http://" + ln.Addr().String(), "token": h.token, "me": h.name, "version": version})
 	fmt.Println(string(ready))
 
-	srv := &http.Server{Handler: h.routes(), BaseContext: func(net.Listener) context.Context { return ctx }}
+	go h.keepCookies(ctx)
+	srv := &http.Server{Handler: h.routes(), BaseContext: func(net.Listener) context.Context { return ctx }, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		h.cli.RealtimeDisconnect()
@@ -137,25 +190,73 @@ func main() {
 	}
 }
 
+type helper struct {
+	log     zerolog.Logger
+	keys    store
+	session Session
+	jar     *linkedingo.StringCookieJar
+	cli     *linkedingo.Client
+	me      linkedingo.URN
+	name    string
+	token   string
+
+	mu         sync.Mutex
+	subs       map[chan []byte]struct{}
+	state      string
+	stateErr   string
+	lastEvent  time.Time
+	counts     map[string]int
+	saved      string
+	savedToken string
+
+	peopleMu sync.Mutex
+	people   map[string]person
+	threads  map[string]linkedingo.URN
+}
+
+func newHelper(log zerolog.Logger, keys store) *helper {
+	return &helper{log: log, keys: keys, subs: map[chan []byte]struct{}{}, counts: map[string]int{}, people: map[string]person{}, threads: map[string]linkedingo.URN{}, state: "starting"}
+}
+
+// exit says why it stopped on stdout, as the ready line would, and exits: the
+// Mac app asks the person to sign in again on signed_out, and retries otherwise.
+func (h *helper) exit(err error, what string) {
+	signedOut := errors.Is(err, errNoSession) || isSignedOut(err)
+	why := "failed"
+	code := exitFailed
+	if signedOut {
+		why, code = "signed_out", exitSignedOut
+	}
+	line, _ := json.Marshal(map[string]any{"ready": false, "error": why, "why": err.Error()})
+	fmt.Println(string(line))
+	h.log.Error().Err(err).Msg(what)
+	os.Exit(code)
+}
+
+func isSignedOut(err error) bool {
+	var re *linkedingo.ResponseError
+	return errors.Is(err, linkedingo.ErrTokenInvalidated) || (errors.As(err, &re) && (re.StatusCode == http.StatusUnauthorized || re.StatusCode == http.StatusForbidden))
+}
+
 func (h *helper) load() error {
-	data, err := os.ReadFile(h.path)
+	s, err := h.keys.Load()
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(data, &h.session); err != nil {
-		return err
-	}
+	h.session = s
 	h.jar = linkedingo.NewEmptyStringCookieJar()
 	if err := h.jar.UnmarshalJSON(h.session.Cookies); err != nil {
 		return fmt.Errorf("cookies: %w", err)
 	}
 	if h.jar.GetCookie(linkedingo.LinkedInCookieJSESSIONID) == "" {
-		return errors.New("the session has no JSESSIONID cookie: sign in again")
+		return errNoSession
 	}
+	h.saved, h.savedToken = string(h.session.Cookies), h.session.SyncToken
 	return nil
 }
 
-// save keeps the cookies LinkedIn rotated and the sync token for the next start.
+// save keeps the cookies LinkedIn rotated and the sync token for the next start,
+// in the Keychain. It writes only when something changed.
 func (h *helper) save() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -163,10 +264,35 @@ func (h *helper) save() {
 	if err != nil {
 		return
 	}
+	if string(cookies) == h.saved && h.session.SyncToken == h.savedToken {
+		return
+	}
 	h.session.Cookies = cookies
-	data, _ := json.MarshalIndent(h.session, "", "  ")
-	if err := os.WriteFile(h.path, data, 0o600); err != nil {
+	if err := h.keys.Save(h.session); err != nil {
 		h.log.Warn().Err(err).Msg("Couldn't save the session")
+		return
+	}
+	h.saved, h.savedToken = string(cookies), h.session.SyncToken
+}
+
+// keepCookies saves the cookies once a minute when LinkedIn rotated one: a local
+// check of the jar, never a call to LinkedIn.
+func (h *helper) keepCookies(ctx context.Context) {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			cookies, err := h.jar.MarshalJSON()
+			h.mu.Lock()
+			changed := err == nil && string(cookies) != h.saved
+			h.mu.Unlock()
+			if changed {
+				h.save()
+			}
+		}
 	}
 }
 
@@ -187,11 +313,11 @@ func (h *helper) start(ctx context.Context) error {
 		return fmt.Errorf("signed-in check: %w", err)
 	}
 	if profile.MiniProfile.EntityURN.ID() == "" {
-		return errors.New("LinkedIn didn't say who is signed in: the cookies are bad")
+		return fmt.Errorf("%w: LinkedIn didn't say who is signed in", linkedingo.ErrTokenInvalidated)
 	}
 	h.me = linkedingo.NewURN(profile.MiniProfile.EntityURN.ID())
 	h.name = strings.TrimSpace(profile.MiniProfile.FirstName + " " + profile.MiniProfile.LastName)
-	h.log.Info().Str("me", h.name).Msg("Signed in")
+	h.log.Info().Msg("Signed in")
 
 	h.cli = linkedingo.NewClient(ctx, h.me, h.jar, h.session.PageInstance, h.session.XLITrack, h.session.SyncToken, linkedingo.Handlers{
 		Heartbeat: func(context.Context) { h.setState("connected", "") },
@@ -253,14 +379,14 @@ func (h *helper) onEvent(_ context.Context, ev *linkedingo.DecoratedEvent) {
 	case data.DecoratedMessage != nil:
 		msg := data.DecoratedMessage.Result
 		h.publish("message", map[string]any{
-			"conversation": msg.Conversation.EntityURN.String(),
+			"thread":       h.thread(msg.Conversation.EntityURN),
 			"message":      h.message(msg),
 			"leftServerAt": ev.LeftServerAt.UnixMilli(),
 		})
 	case data.DecoratedConversation != nil:
 		h.publish("conversation", h.conversation(data.DecoratedConversation.Result))
 	case data.DecoratedSeenReceipt != nil:
-		h.publish("seen", map[string]any{"topic": ev.Topic.String()})
+		h.publish("seen", map[string]any{})
 	}
 }
 
@@ -285,6 +411,7 @@ type person struct {
 	Photo    string `json:"photo,omitempty"`
 	URL      string `json:"url,omitempty"`
 	Me       bool   `json:"me,omitempty"`
+	Org      bool   `json:"org,omitempty"`
 }
 
 type message struct {
@@ -292,7 +419,6 @@ type message struct {
 	From     person   `json:"from"`
 	Text     string   `json:"text"`
 	At       int64    `json:"at"`
-	Format   string   `json:"format,omitempty"`
 	Attached []string `json:"attached,omitempty"`
 }
 
@@ -306,6 +432,37 @@ type conversation struct {
 	People       []person `json:"people"`
 	Last         *message `json:"last,omitempty"`
 	Categories   []string `json:"categories,omitempty"`
+}
+
+// tail is the last part of a URN's tuple: a conversation's thread id
+// ("2-…") or a message's id, as LinkedIn's own web addresses name them.
+func tail(u linkedingo.URN) string {
+	id := strings.TrimSuffix(strings.TrimPrefix(u.ID(), "("), ")")
+	if i := strings.LastIndex(id, ","); i >= 0 {
+		return id[i+1:]
+	}
+	return id
+}
+
+// thread names a conversation by its thread id, and remembers its whole URN so
+// a later read of the thread asks LinkedIn for exactly that conversation.
+func (h *helper) thread(u linkedingo.URN) string {
+	t := tail(u)
+	if t != "" {
+		h.peopleMu.Lock()
+		h.threads[t] = u
+		h.peopleMu.Unlock()
+	}
+	return t
+}
+
+func (h *helper) conversationURN(thread string) linkedingo.URN {
+	h.peopleMu.Lock()
+	defer h.peopleMu.Unlock()
+	if u, ok := h.threads[thread]; ok {
+		return u
+	}
+	return linkedingo.NewURN("urn:li:msg_conversation:(urn:li:fsd_profile:" + h.me.ID() + "," + thread + ")")
 }
 
 func (h *helper) person(p linkedingo.MessagingParticipant) person {
@@ -323,6 +480,7 @@ func (h *helper) person(p linkedingo.MessagingParticipant) person {
 		o := p.ParticipantType.Organization
 		out.Name = o.Name.Text
 		out.URL = o.PageURL
+		out.Org = true
 		if o.Logo != nil {
 			out.Photo = o.Logo.GetLargestArtifactURL()
 		}
@@ -342,11 +500,10 @@ func (h *helper) person(p linkedingo.MessagingParticipant) person {
 
 func (h *helper) message(m linkedingo.Message) message {
 	out := message{
-		ID:     m.EntityURN.String(),
-		From:   h.person(m.Sender),
-		Text:   m.Body.Text,
-		At:     m.DeliveredAt.UnixMilli(),
-		Format: string(m.MessageBodyRenderFormat),
+		ID:   tail(m.EntityURN),
+		From: h.person(m.Sender),
+		Text: m.Body.Text,
+		At:   m.DeliveredAt.UnixMilli(),
 	}
 	for _, rc := range m.RenderContent {
 		switch {
@@ -373,7 +530,7 @@ func (h *helper) message(m linkedingo.Message) message {
 
 func (h *helper) conversation(c linkedingo.Conversation) conversation {
 	out := conversation{
-		ID:           c.EntityURN.String(),
+		ID:           h.thread(c.EntityURN),
 		Title:        c.Title,
 		Group:        c.GroupChat,
 		Unread:       !c.Read,
@@ -392,16 +549,20 @@ func (h *helper) conversation(c linkedingo.Conversation) conversation {
 	if out.Title == "" {
 		out.Title = strings.Join(names, ", ")
 	}
-	if n := len(c.Messages.Elements); n > 0 {
-		last := h.message(c.Messages.Elements[n-1])
-		for _, m := range c.Messages.Elements {
-			if m.DeliveredAt.UnixMilli() > last.At {
-				last = h.message(m)
-			}
+	for _, m := range c.Messages.Elements {
+		if out.Last == nil || m.DeliveredAt.UnixMilli() > out.Last.At {
+			last := h.message(m)
+			out.Last = &last
 		}
-		out.Last = &last
 	}
 	return out
+}
+
+func timeParam(r *http.Request) time.Time {
+	if ms, err := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64); err == nil && ms > 0 {
+		return time.UnixMilli(ms)
+	}
+	return time.Now()
 }
 
 func (h *helper) routes() http.Handler {
@@ -410,18 +571,14 @@ func (h *helper) routes() http.Handler {
 		h.mu.Lock()
 		defer h.mu.Unlock()
 		writeJSON(w, map[string]any{
-			"me": h.name, "state": h.state, "error": h.stateErr,
+			"me": h.name, "state": h.state, "error": h.stateErr, "version": version,
 			"lastEvent": h.lastEvent.UnixMilli(), "events": h.counts, "listeners": len(h.subs),
 		})
 	})
 	mux.HandleFunc("GET /conversations", func(w http.ResponseWriter, r *http.Request) {
-		before := time.Now()
-		if ms, err := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64); err == nil {
-			before = time.UnixMilli(ms)
-		}
-		resp, err := h.cli.GetConversationsUpdatedBefore(r.Context(), before)
+		resp, err := h.cli.GetConversationsUpdatedBefore(r.Context(), timeParam(r))
 		if err != nil {
-			fail(w, err)
+			h.fail(w, err)
 			return
 		}
 		out := []conversation{}
@@ -432,18 +589,19 @@ func (h *helper) routes() http.Handler {
 		}
 		writeJSON(w, map[string]any{"conversations": out})
 	})
-	mux.HandleFunc("GET /conversations/{urn}/messages", func(w http.ResponseWriter, r *http.Request) {
-		before := time.Now()
-		if ms, err := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64); err == nil {
-			before = time.UnixMilli(ms)
+	mux.HandleFunc("GET /threads/{thread}/messages", func(w http.ResponseWriter, r *http.Request) {
+		thread := r.PathValue("thread")
+		if thread == "" || strings.ContainsAny(thread, "(),:/ ") || len(thread) > 200 {
+			http.Error(w, "not a thread", http.StatusBadRequest)
+			return
 		}
 		count := 20
 		if n, err := strconv.Atoi(r.URL.Query().Get("count")); err == nil && n > 0 && n <= 50 {
 			count = n
 		}
-		resp, err := h.cli.GetMessagesBefore(r.Context(), linkedingo.NewURN(r.PathValue("urn")), before, count)
+		resp, err := h.cli.GetMessagesBefore(r.Context(), h.conversationURN(thread), timeParam(r), count)
 		if err != nil {
-			fail(w, err)
+			h.fail(w, err)
 			return
 		}
 		out := []message{}
@@ -486,7 +644,7 @@ func (h *helper) routes() http.Handler {
 	return h.auth(mux)
 }
 
-// auth lets in only the Mac app: the token, and no browser page on another origin.
+// auth lets in only the Mac app: the token, and no browser page on any origin.
 func (h *helper) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+h.token || r.Header.Get("Origin") != "" {
@@ -502,11 +660,14 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func fail(w http.ResponseWriter, err error) {
+// fail answers a LinkedIn error. Signed out is 401 and an event, so the Mac app
+// asks the person to sign in again.
+func (h *helper) fail(w http.ResponseWriter, err error) {
 	status := http.StatusBadGateway
-	var re *linkedingo.ResponseError
-	if errors.As(err, &re) && re.StatusCode == http.StatusUnauthorized || errors.Is(err, linkedingo.ErrTokenInvalidated) {
+	if isSignedOut(err) {
 		status = http.StatusUnauthorized
+		h.setState("signed_out", err.Error())
+		h.publish("signed_out", map[string]any{"error": err.Error()})
 	}
 	http.Error(w, err.Error(), status)
 }
